@@ -44,6 +44,28 @@ export async function clientHandlerRoutes(app: FastifyInstance, options: { datab
     await service.handleIncomingWhatsAppMessage(msg);
   });
 
+  // Automatically check and process missed WhatsApp messages when socket becomes ready
+  let missedCheckTimeout: NodeJS.Timeout | null = null;
+  const scheduleMissedCheck = () => {
+    if (missedCheckTimeout) clearTimeout(missedCheckTimeout);
+    missedCheckTimeout = setTimeout(() => {
+      void service.checkAndProcessMissedMessages().catch((err) => {
+        app.log.warn({ err }, 'Failed automatic check for missed WhatsApp messages');
+      });
+    }, 1200);
+  };
+
+  baileys.events.on('ready', scheduleMissedCheck);
+  baileys.events.on('status', (status: any) => {
+    if (status?.isReady) {
+      scheduleMissedCheck();
+    }
+  });
+
+  if (baileys.getStatus().isReady) {
+    scheduleMissedCheck();
+  }
+
   // 1. Webhook for incoming WhatsApp messages (kept for backward compatibility)
   app.post('/api/webhooks/waha/message', async (request, reply) => {
     const body = (request.body || {}) as Record<string, unknown>;
@@ -58,6 +80,32 @@ export async function clientHandlerRoutes(app: FastifyInstance, options: { datab
     }
   });
 
+  // 1b. Webhook for WhatsApp delivery & read status ACKs
+  app.post('/api/webhooks/waha/ack', async (request) => {
+    const body = (request.body || {}) as Record<string, unknown>;
+    const payload = (body.payload || body) as Record<string, unknown>;
+    const providerMessageId = String(payload.id || payload.messageId || (payload._data as any)?.id || '');
+    const rawAck = payload.ack !== undefined ? payload.ack : (payload._data as any)?.ack;
+
+    const statusMap: Record<number, any> = {
+      1: 'Pending',
+      2: 'Sent',
+      3: 'Delivered',
+      4: 'Read',
+      5: 'Played',
+    };
+
+    const mapped = typeof rawAck === 'number' ? statusMap[rawAck] : undefined;
+    if (providerMessageId && mapped) {
+      options.database.updateWhatsAppStatusByProviderId(providerMessageId, mapped);
+      const leadId = options.database.getLeadIdByProviderMessageId(providerMessageId) || undefined;
+      baileys.events.emit('message_status', { providerMessageId, status: mapped, leadId });
+      clientHandlerEvents.emit('message_status', { providerMessageId, status: mapped, leadId });
+      return { ok: true, providerMessageId, status: mapped, leadId };
+    }
+    return { ok: true, ignored: true };
+  });
+
   // Protected Client Handler Endpoints
   app.register(async (authedApp) => {
     authedApp.addHook('preHandler', authenticate);
@@ -68,6 +116,18 @@ export async function clientHandlerRoutes(app: FastifyInstance, options: { datab
       const clients = service.listClients(query.stage, query.q);
       const stats = service.getStats();
       return { ok: true, clients, stats };
+    });
+
+    // Inspect pending missed WhatsApp messages received while offline
+    authedApp.get('/api/clients/missed-messages', async () => {
+      const missed = service.getMissedMessages();
+      return { ok: true, count: missed.length, missed };
+    });
+
+    // Manually trigger processing of any missed WhatsApp messages
+    authedApp.post('/api/clients/check-missed-messages', async () => {
+      const result = await service.checkAndProcessMissedMessages();
+      return { ok: true, result };
     });
 
     // Real-time Server-Sent Events (SSE) stream for incoming/outgoing messages & status updates
@@ -105,6 +165,7 @@ export async function clientHandlerRoutes(app: FastifyInstance, options: { datab
       clientHandlerEvents.on('message_received', onMessageReceived);
       clientHandlerEvents.on('message_sent', onMessageSent);
       clientHandlerEvents.on('conversation_updated', onConversationUpdated);
+      clientHandlerEvents.on('message_status', onMessageStatus);
       baileys.events.on('message_status', onMessageStatus);
 
       const heartbeat = setInterval(() => {
@@ -122,6 +183,7 @@ export async function clientHandlerRoutes(app: FastifyInstance, options: { datab
         clientHandlerEvents.off('message_received', onMessageReceived);
         clientHandlerEvents.off('message_sent', onMessageSent);
         clientHandlerEvents.off('conversation_updated', onConversationUpdated);
+        clientHandlerEvents.off('message_status', onMessageStatus);
         baileys.events.off('message_status', onMessageStatus);
       });
 

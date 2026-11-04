@@ -5,6 +5,7 @@ import {
   Sparkles,
   CheckCircle2,
   AlertCircle,
+  AlertTriangle,
   Clock,
   Globe,
   Building2,
@@ -147,8 +148,41 @@ export const JobFinderPage: React.FC<JobFinderPageProps> = ({ onBackToProspectin
   const [uploadingResume, setUploadingResume] = useState(false);
   const [selectedResumeTemplate, setSelectedResumeTemplate] = useState('software_engineering');
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [isSyncingGmail, setIsSyncingGmail] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleSyncGmail = async () => {
+    setIsSyncingGmail(true);
+    try {
+      const res = await api.syncGmailApplications();
+      if (res.ok && res.summary) {
+        const { bouncesDetected, bouncesApplied, sentConfirmed, repliesDetected } = res.summary;
+        showToast(
+          'success',
+          `Gmail synchronized: ${bouncesDetected} bounce notices checked (${bouncesApplied} updated), ${sentConfirmed} confirmed sent, ${repliesDetected} replies detected.`
+        );
+        const [updatedApps, updatedNotifs] = await Promise.all([
+          api.getJobApplications().catch(() => null),
+          api.getJobNotifications().catch(() => null),
+        ]);
+        if (updatedApps?.ok) {
+          setApplications(updatedApps.applications);
+          setAppStats(updatedApps.stats);
+          setTodayAppsCount(updatedApps.todayCount);
+        }
+        if (updatedNotifs?.ok) {
+          setNotifications(updatedNotifs.notifications);
+        }
+      } else {
+        showToast('error', res.error || 'Failed to sync with Gmail.');
+      }
+    } catch (err: any) {
+      showToast('error', err.message || 'Gmail sync failed.');
+    } finally {
+      setIsSyncingGmail(false);
+    }
+  };
 
   const showToast = (type: 'success' | 'error', message: string) => {
     setFeedback({ type, message });
@@ -1037,7 +1071,7 @@ export const JobFinderPage: React.FC<JobFinderPageProps> = ({ onBackToProspectin
             ) : (
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(360px, 1fr))', gap: 16 }}>
                 {jobs.map((job) => {
-                  const score = job.matchScore || 50;
+                  const score = typeof job.matchScore === 'number' ? job.matchScore : 50;
                   const isHigh = score >= 75;
                   const isMid = score >= 55 && score < 75;
 
@@ -1340,25 +1374,50 @@ export const JobFinderPage: React.FC<JobFinderPageProps> = ({ onBackToProspectin
                 <h3 style={{ fontSize: '16px', fontWeight: 800, color: '#0f172a', margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
                   <TrendingUp size={18} color="#4f46e5" /> Active Application Pipeline
                 </h3>
-                <button
-                  type="button"
-                  onClick={() => setEmailHistoryModalOpen(true)}
-                  style={{
-                    background: '#f8fafc',
-                    color: '#334155',
-                    border: '1px solid #cbd5e1',
-                    padding: '8px 14px',
-                    borderRadius: 8,
-                    fontSize: '12px',
-                    fontWeight: 700,
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 6
-                  }}
-                >
-                  <Inbox size={14} color="#6366f1" /> Sent Emails Archive ({applicationEmails.length})
-                </button>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    onClick={handleSyncGmail}
+                    disabled={isSyncingGmail}
+                    style={{
+                      background: '#eff6ff',
+                      color: '#1d4ed8',
+                      border: '1px solid #bfdbfe',
+                      padding: '8px 14px',
+                      borderRadius: 8,
+                      fontSize: '12px',
+                      fontWeight: 700,
+                      cursor: isSyncingGmail ? 'not-allowed' : 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                    }}
+                    title="Scan Gmail for bounce notices, delivery failures, and employer replies"
+                  >
+                    <RefreshCw size={14} className={isSyncingGmail ? 'spin' : ''} />
+                    {isSyncingGmail ? 'Checking Gmail…' : 'Sync with Gmail (Check Bounces)'}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setEmailHistoryModalOpen(true)}
+                    style={{
+                      background: '#f8fafc',
+                      color: '#334155',
+                      border: '1px solid #cbd5e1',
+                      padding: '8px 14px',
+                      borderRadius: 8,
+                      fontSize: '12px',
+                      fontWeight: 700,
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6
+                    }}
+                  >
+                    <Inbox size={14} color="#6366f1" /> Sent Emails Archive ({applicationEmails.length})
+                  </button>
+                </div>
               </div>
 
               {applications.length === 0 ? (
@@ -1391,17 +1450,37 @@ export const JobFinderPage: React.FC<JobFinderPageProps> = ({ onBackToProspectin
                           </span>
                           {app.deliveryStatus && (
                             <span style={{
-                              background: app.deliveryStatus === 'delivered' ? '#ecfdf5' : '#eff6ff',
-                              color: app.deliveryStatus === 'delivered' ? '#047857' : '#1d4ed8',
+                              background:
+                                app.deliveryStatus === 'bounced' || app.status === 'bounced' || app.status === 'failed'
+                                  ? '#fee2e2'
+                                  : app.deliveryStatus === 'opened_in_gmail' || app.status === 'opened_in_gmail'
+                                  ? '#fef3c7'
+                                  : app.deliveryStatus === 'accepted_by_provider'
+                                  ? '#eff6ff'
+                                  : '#ecfdf5',
+                              color:
+                                app.deliveryStatus === 'bounced' || app.status === 'bounced' || app.status === 'failed'
+                                  ? '#b91c1c'
+                                  : app.deliveryStatus === 'opened_in_gmail' || app.status === 'opened_in_gmail'
+                                  ? '#b45309'
+                                  : app.deliveryStatus === 'accepted_by_provider'
+                                  ? '#1d4ed8'
+                                  : '#047857',
                               fontSize: '10px',
                               fontWeight: 700,
                               padding: '2px 8px',
                               borderRadius: 999
                             }}>
-                              {app.deliveryStatus.toUpperCase()}
+                              ● {app.deliveryStatus === 'accepted_by_provider' ? 'ACCEPTED BY SMTP' : app.deliveryStatus.toUpperCase().replace(/_/g, ' ')}
                             </span>
                           )}
                         </div>
+                        {app.failureReason && (
+                          <div style={{ marginTop: 4, fontSize: '11px', color: '#b91c1c', display: 'flex', alignItems: 'center', gap: 4 }}>
+                            <AlertTriangle size={12} />
+                            <span><strong>Delivery Note:</strong> {app.failureReason}</span>
+                          </div>
+                        )}
                         <div style={{ fontSize: '12px', color: '#64748b', marginTop: 4, display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
                           <span>Date: {new Date(app.appliedAt).toLocaleDateString()}</span>
                           {app.recipientEmail && (
@@ -1474,12 +1553,18 @@ export const JobFinderPage: React.FC<JobFinderPageProps> = ({ onBackToProspectin
                           }}
                         >
                           <option value="draft">Draft</option>
+                          <option value="draft_created">Draft Created</option>
                           <option value="ready_to_send">Ready to Send</option>
                           <option value="ready_to_apply">Ready to Apply</option>
                           <option value="awaiting_approval">Awaiting Approval</option>
+                          <option value="opened_in_gmail">Opened in Gmail</option>
+                          <option value="awaiting_confirmation">Awaiting Send Confirmation</option>
+                          <option value="accepted_by_provider">Accepted by SMTP</option>
                           <option value="sent">Email Sent</option>
                           <option value="delivery_confirmed">Delivery Confirmed</option>
                           <option value="submitted">Submitted / In Progress</option>
+                          <option value="bounced">Bounced / Rejected</option>
+                          <option value="failed">Delivery Failed</option>
                           <option value="awaiting_response">Awaiting Response</option>
                           <option value="under_review">Under Review</option>
                           <option value="replied">Employer Replied</option>
@@ -1490,7 +1575,6 @@ export const JobFinderPage: React.FC<JobFinderPageProps> = ({ onBackToProspectin
                           <option value="accepted">Offer Accepted</option>
                           <option value="rejected">Rejected</option>
                           <option value="withdrawn">Withdrawn</option>
-                          <option value="failed">Delivery Failed</option>
                         </select>
                       </div>
                     </div>
@@ -2092,17 +2176,28 @@ export const JobFinderPage: React.FC<JobFinderPageProps> = ({ onBackToProspectin
               </div>
 
               <div>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#334155', marginBottom: 6 }}>
-                  Minimum Match Threshold: <strong style={{ color: '#4f46e5' }}>{config.minCompatibilityScore}% compatibility</strong>
-                </label>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                  <label style={{ fontSize: '12px', fontWeight: 700, color: '#334155' }}>
+                    Minimum Match Threshold: <strong style={{ color: '#4f46e5' }}>{config.minCompatibilityScore}% compatibility</strong>
+                  </label>
+                  <span style={{ fontSize: '11px', color: '#64748b' }}>Full 0–100% Control</span>
+                </div>
                 <input
                   type="range"
-                  min="50"
-                  max="95"
-                  value={config.minCompatibilityScore}
+                  min="0"
+                  max="100"
+                  step="1"
+                  value={config.minCompatibilityScore ?? 50}
                   onChange={(e) => setConfig({ ...config, minCompatibilityScore: Number(e.target.value) })}
                   style={{ width: '100%' }}
                 />
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: '#94a3b8', marginTop: 3 }}>
+                  <span>0% (All Jobs)</span>
+                  <span>25%</span>
+                  <span>50%</span>
+                  <span>75%</span>
+                  <span>100% (Exact Fit)</span>
+                </div>
               </div>
             </div>
 

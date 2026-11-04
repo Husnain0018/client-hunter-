@@ -29,7 +29,7 @@ import {
 const pinoLogger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'warn' });
 
 export interface IncomingAttachmentInfo {
-  type: 'image' | 'video' | 'audio' | 'voice' | 'document' | 'location' | 'contact';
+  type: 'image' | 'video' | 'audio' | 'voice' | 'document' | 'location' | 'contact' | 'sticker';
   mimeType?: string;
   fileName?: string;
   caption?: string;
@@ -82,12 +82,12 @@ async function resolveWaWebVersion(): Promise<[number, number, number]> {
 }
 
 export function normalizeToInternationalWhatsApp(raw: string): string {
-  let digits = raw.replace(/\D/g, '');
+  let digits = (raw || '').split('@')[0].split(':')[0].replace(/\D/g, '');
   if (digits.startsWith('00')) {
     digits = digits.slice(2);
   }
-  // Pakistan standard 03xx -> 923xx
-  if (digits.startsWith('0') && digits.length === 11 && digits.startsWith('03')) {
+  // Standard national prefix 0 (Pakistan 03xx, 055, 042, etc. - 10 to 11 digits)
+  if (digits.startsWith('0') && (digits.length === 10 || digits.length === 11)) {
     digits = '92' + digits.slice(1);
   }
   return digits;
@@ -353,6 +353,22 @@ export class BaileysManager {
           this.handleContactsOrChatsLidSync(chats as any[]);
         });
 
+        sock.ev.on('messaging-history.set', async (history) => {
+          try {
+            if (history.contacts?.length || history.chats?.length) {
+              this.handleContactsOrChatsLidSync([...(history.contacts || []), ...(history.chats || [])]);
+            }
+            if (history.messages && history.messages.length > 0) {
+              await this.handleMessagesUpsert({
+                messages: history.messages,
+                type: 'append',
+              });
+            }
+          } catch (err) {
+            pinoLogger.error({ err }, 'Error processing Baileys messaging-history.set event');
+          }
+        });
+
         try {
           (sock.ev as any).on('lid-mapping.update', (mapping: any) => {
             if (mapping?.lid && mapping?.pn) {
@@ -431,6 +447,7 @@ export class BaileysManager {
       }
       this.recordDiagnostic('connected', `Connected as ${this.account?.phone || this.account?.id || 'device'}`);
       this.emitStatus();
+      this.events.emit('ready', this.getStatus());
     } else if (connection === 'close') {
       this.handleConnectionClose(lastDisconnect);
     }
@@ -762,6 +779,19 @@ export class BaileysManager {
     const sent = await this.sock.sendMessage(targetJid, { text: cleanText });
     const providerMessageId = sent?.key?.id || `baileys_${Date.now()}`;
 
+    // Proactively query and save LID mapping for this contact so replies via @lid match seamlessly
+    try {
+      const lidRepo = (this.sock as any).signalRepository?.lidMapping;
+      if (lidRepo && typeof lidRepo.getLIDForPN === 'function') {
+        const lidJid = await lidRepo.getLIDForPN(targetJid);
+        if (lidJid) {
+          this.db.saveLidPhoneMapping(String(lidJid), cleanDigits);
+        }
+      }
+    } catch {
+      // ignore
+    }
+
     return {
       providerMessageId,
       status: 'Sent',
@@ -950,11 +980,33 @@ export class BaileysManager {
       };
     }
 
+    if (content.stickerMessage) {
+      attachments.push({ type: 'sticker', mimeType: content.stickerMessage.mimetype || 'image/webp' });
+      return {
+        text: '[Sticker received]',
+        messageType: 'sticker',
+        attachments,
+        isNonChatProtocol: false,
+      };
+    }
+
     if (content.contactMessage) {
       const name = content.contactMessage.displayName || 'Contact Card';
       attachments.push({ type: 'contact', caption: name });
       return {
         text: `[👤 Contact shared: ${name}]`,
+        messageType: 'contact',
+        attachments,
+        isNonChatProtocol: false,
+      };
+    }
+
+    if (content.contactsArrayMessage) {
+      const contacts = content.contactsArrayMessage.contacts || [];
+      const first = contacts[0]?.displayName || 'Contacts';
+      attachments.push({ type: 'contact', caption: `${first} (${contacts.length})` });
+      return {
+        text: `[👤 Contact card(s) shared: ${first}]`,
         messageType: 'contact',
         attachments,
         isNonChatProtocol: false,
@@ -1061,7 +1113,14 @@ export class BaileysManager {
   }): Promise<void> {
     const isHistoryAppend = upsert.type && upsert.type.toLowerCase() !== 'notify';
 
-    for (const msg of upsert.messages) {
+    // Sort chronologically so multiple missed messages from offline periods are processed in order
+    const sortedMessages = [...(upsert.messages || [])].sort((a, b) => {
+      const tsA = Number(a.messageTimestamp || 0);
+      const tsB = Number(b.messageTimestamp || 0);
+      return tsA - tsB;
+    });
+
+    for (const msg of sortedMessages) {
       if (!msg.key || !msg.message) continue;
 
       const rawRemoteJid = msg.key.remoteJid || '';
@@ -1159,7 +1218,8 @@ export class BaileysManager {
       const mapped = statusMap[item.update.status];
       if (mapped) {
         this.db.updateWhatsAppStatusByProviderId(id, mapped);
-        this.events.emit('message_status', { providerMessageId: id, status: mapped });
+        const leadId = this.db.getLeadIdByProviderMessageId(id) || undefined;
+        this.events.emit('message_status', { providerMessageId: id, status: mapped, leadId });
       }
     }
   }

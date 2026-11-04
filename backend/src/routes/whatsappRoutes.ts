@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { authenticate } from '../security/auth.js';
 import type { Database } from '../db/database.js';
 import { BaileysManager } from '../services/baileysManager.js';
+import { clientHandlerEvents } from '../services/clientHandlerService.js';
 
 const sendSchema = z.object({
   number: z.string().trim().min(8).max(25),
@@ -140,15 +141,26 @@ export async function whatsappRoutes(app: FastifyInstance, options: { database: 
 
       try {
         const result = await baileys.sendTextMessage(parsed.data.number, parsed.data.message);
-        if (parsed.data.leadId) {
-          options.database.updateWhatsApp(parsed.data.leadId, {
+        const targetLeadId = parsed.data.leadId || options.database.findLeadByPhone(parsed.data.number)?.leadId;
+        if (targetLeadId) {
+          options.database.updateWhatsApp(targetLeadId, {
             status: result.status,
             providerMessageId: result.providerMessageId,
           });
-          options.database.updateLead(parsed.data.leadId, {
+          options.database.updateLead(targetLeadId, {
             whatsappStatus: result.status,
             whatsappRunId: result.providerMessageId,
           });
+          const client = options.database.getClientConversation(targetLeadId);
+          const convMsgs = options.database.getConversationMessages(targetLeadId);
+          const lastMsg = convMsgs[convMsgs.length - 1];
+          if (client && lastMsg) {
+            clientHandlerEvents.emit('message_sent', {
+              leadId: targetLeadId,
+              message: lastMsg,
+              client,
+            });
+          }
         }
         return { ok: true, result };
       } catch (err) {

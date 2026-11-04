@@ -496,25 +496,31 @@ export interface GeneratedResume {
 
 export type JobApplicationStatus =
   | 'draft'
+  | 'draft_created'
   | 'ready_to_send'
   | 'ready_to_apply'
-  | 'sent'
-  | 'submitted'
-  | 'delivery_confirmed'
-  | 'awaiting_response'
   | 'awaiting_approval'
+  | 'opened_in_gmail'
+  | 'awaiting_confirmation'
+  | 'sending'
+  | 'sent'
+  | 'accepted_by_provider'
+  | 'delivery_confirmed'
+  | 'submitted'
+  | 'awaiting_response'
   | 'under_review'
   | 'replied'
   | 'interview_invited'
   | 'interview_scheduled'
   | 'interview'
   | 'rejected'
+  | 'bounced'
+  | 'failed'
   | 'shortlisted'
   | 'offer_received'
   | 'offer'
   | 'accepted'
   | 'withdrawn'
-  | 'failed'
   | 'requires_manual_completion';
 
 export interface ApplicationActivityEvent {
@@ -551,8 +557,24 @@ export interface JobApplicationEmailRecord {
   resumeId?: string;
   resumeName?: string;
   sentAt: string;
-  deliveryStatus: 'sent' | 'delivery_confirmed' | 'failed';
+  deliveryStatus:
+    | 'draft'
+    | 'draft_created'
+    | 'awaiting_approval'
+    | 'opened_in_gmail'
+    | 'awaiting_confirmation'
+    | 'sending'
+    | 'sent'
+    | 'accepted_by_provider'
+    | 'delivery_confirmed'
+    | 'failed'
+    | 'bounced'
+    | 'rejected'
+    | 'replied';
   failureReason?: string;
+  smtpResponseCode?: string | number;
+  bounceReason?: string;
+  recommendedAction?: string;
   createdAt: string;
 }
 
@@ -574,6 +596,9 @@ export interface JobApplication {
   emailBody?: string;
   sentAt?: string;
   deliveryStatus?: string;
+  smtpResponseCode?: string | number;
+  bounceReason?: string;
+  recommendedAction?: string;
   employerResponses?: EmployerResponseRecord[];
   activityTimeline?: ApplicationActivityEvent[];
   appliedAt: string;

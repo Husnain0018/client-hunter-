@@ -851,7 +851,7 @@ export class Database {
     const lidDigits = (lidOrJid || '').split('@')[0].split(':')[0].replace(/\D/g, '');
     let phoneDigits = (phoneOrJid || '').split('@')[0].split(':')[0].replace(/\D/g, '');
     if (phoneDigits.startsWith('00')) phoneDigits = phoneDigits.slice(2);
-    if (phoneDigits.startsWith('03') && phoneDigits.length === 11) {
+    if (phoneDigits.startsWith('0') && (phoneDigits.length === 10 || phoneDigits.length === 11)) {
       phoneDigits = '92' + phoneDigits.slice(1);
     }
     if (!lidDigits || !phoneDigits || lidDigits === phoneDigits) return;
@@ -862,13 +862,21 @@ export class Database {
     ]);
   }
 
-  private normalizePhoneDigits(raw: string): string {
+  normalizePhoneDigits(raw: string): string {
     let digits = (raw || '').split('@')[0].split(':')[0].replace(/\D/g, '');
     if (digits.startsWith('00')) digits = digits.slice(2);
-    if (digits.startsWith('03') && digits.length === 11) {
+    if (digits.startsWith('0') && (digits.length === 10 || digits.length === 11)) {
       digits = '92' + digits.slice(1);
     }
     return digits;
+  }
+
+  getLeadIdByProviderMessageId(providerMessageId: string): string | null {
+    if (!providerMessageId) return null;
+    const msg = this.stmt('SELECT lead_id FROM conversation_messages WHERE provider_message_id = ? LIMIT 1').get(providerMessageId) as { lead_id: string } | undefined;
+    if (msg?.lead_id) return msg.lead_id;
+    const wa = this.stmt('SELECT lead_id FROM whatsapp_messages WHERE provider_message_id = ? LIMIT 1').get(providerMessageId) as { lead_id: string } | undefined;
+    return wa?.lead_id || null;
   }
 
   findLeadByPhone(rawPhone: string): Lead | null {
@@ -1241,6 +1249,64 @@ export class Database {
     if (!providerMessageId) return false;
     const res = this.stmt('UPDATE conversation_messages SET status = ? WHERE provider_message_id = ?').run(status, providerMessageId);
     return res.changes > 0;
+  }
+
+  updateConversationMessageMetadata(id: string, metadata: Record<string, unknown>): boolean {
+    if (!id) return false;
+    const existing = this.stmt('SELECT metadata_json FROM conversation_messages WHERE id = ?').get(id) as
+      | { metadata_json: string | null }
+      | undefined;
+    if (!existing) return false;
+    let currentMeta: Record<string, unknown> = {};
+    if (existing.metadata_json) {
+      try {
+        currentMeta = JSON.parse(existing.metadata_json);
+      } catch {
+        // ignore
+      }
+    }
+    const updatedMeta = { ...currentMeta, ...metadata };
+    const res = this.stmt('UPDATE conversation_messages SET metadata_json = ? WHERE id = ?').run(
+      JSON.stringify(updatedMeta),
+      id
+    );
+    return res.changes > 0;
+  }
+
+  getUnrepliedClientMessages(leadId: string): ConversationMessage[] {
+    const messages = this.getConversationMessages(leadId, 200);
+    if (!messages || messages.length === 0) return [];
+
+    // Find the index of the last assistant or user message
+    let lastOutboundIndex = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].sender === 'assistant' || messages[i].sender === 'user') {
+        lastOutboundIndex = i;
+        break;
+      }
+    }
+
+    // Any client messages that appear after the last outbound message are unreplied
+    const unreplied: ConversationMessage[] = [];
+    for (let i = lastOutboundIndex + 1; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.sender === 'client') {
+        if (msg.metadata?.answered !== true) {
+          unreplied.push(msg);
+        }
+      }
+    }
+
+    return unreplied;
+  }
+
+  setLastActiveTimestamp(ts?: string): void {
+    const now = ts || new Date().toISOString();
+    this.setSetting('whatsapp_last_active_at', now);
+  }
+
+  getLastActiveTimestamp(): string | null {
+    return this.getSetting('whatsapp_last_active_at');
   }
 
   getClientConversation(leadId: string): ClientConversation | null {
@@ -1678,8 +1744,8 @@ export class Database {
       this.updateWhatsApp(row.leadId, { status, ...(error !== undefined ? { error } : {}) });
       this.updateLead(row.leadId, { whatsappStatus: status });
     }
-    this.updateConversationMessageStatus(providerMessageId, status);
-    return Boolean(row);
+    const updatedConvMsg = this.updateConversationMessageStatus(providerMessageId, status);
+    return Boolean(row) || updatedConvMsg;
   }
 
   // ==========================================
@@ -2770,7 +2836,10 @@ export class Database {
       id: row.id,
       autoApplyEnabled: Boolean(row.auto_apply_enabled),
       maxDailyApplications: row.max_daily_applications,
-      minCompatibilityScore: row.min_compatibility_score,
+      minCompatibilityScore:
+        row.min_compatibility_score !== null && row.min_compatibility_score !== undefined
+          ? Number(row.min_compatibility_score)
+          : 75,
       preferredCountries: JSON.parse(row.preferred_countries_json || '[]'),
       preferredRoles: JSON.parse(row.preferred_roles_json || '[]'),
       excludedCompanies: JSON.parse(row.excluded_companies_json || '[]'),
@@ -2787,6 +2856,10 @@ export class Database {
     const merged: JobDiscoveryConfig = {
       ...existing,
       ...config,
+      minCompatibilityScore:
+        config.minCompatibilityScore !== undefined
+          ? Math.max(0, Math.min(100, Math.round(Number(config.minCompatibilityScore))))
+          : existing.minCompatibilityScore,
       updatedAt: now,
     };
     this.stmt(`INSERT INTO job_discovery_configs (

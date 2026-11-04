@@ -30,6 +30,28 @@ interface EmailApplicationModalProps {
   onSuccess: (application: JobApplication) => void;
 }
 
+const DUMMY_DOMAINS = [
+  'company.com',
+  'example.com',
+  'example.org',
+  'example.net',
+  'examplecompany.com',
+  'sample.com',
+  'test.com',
+  'domain.com',
+  'yourdomain.com',
+  'email.com',
+  'mail.com',
+  'dummy.com',
+  'placeholder.com',
+];
+
+function isDummyDomain(email: string): boolean {
+  if (!email || !email.includes('@')) return false;
+  const domain = (email.split('@')[1] || '').toLowerCase().trim();
+  return DUMMY_DOMAINS.some((d) => domain === d || domain.endsWith(`.${d}`));
+}
+
 export const EmailApplicationModal: React.FC<EmailApplicationModalProps> = ({
   job,
   profile,
@@ -201,11 +223,55 @@ export const EmailApplicationModal: React.FC<EmailApplicationModalProps> = ({
     }
   };
 
+  const handleOpenInGmail = async () => {
+    if (!recipientEmail.trim()) {
+      setError('Please provide a recipient email address or apply via the company portal.');
+      return;
+    }
+    if (isDummyDomain(recipientEmail)) {
+      setError(`"${recipientEmail}" is a placeholder address (company.com/example.com). Real emails cannot be delivered to dummy domains. Please apply via the official company portal link below.`);
+      return;
+    }
+
+    const gmailUrl = `https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(recipientEmail)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    window.open(gmailUrl, '_blank', 'noopener,noreferrer');
+
+    try {
+      const applyRes = await api.submitJobApplication({
+        jobId: job.id,
+        mode: 'manual',
+        customCoverLetter: body,
+      });
+      if (applyRes.ok && applyRes.application) {
+        await api.openGmailApplication(applyRes.application.id);
+        setSentSuccess({
+          recipient: recipientEmail.trim(),
+          sender: senderEmail.trim(),
+          date: new Date().toLocaleString(),
+          status: 'Opened in Gmail — Awaiting Send Confirmation',
+          attachedResume: selectedAttachmentName || 'None',
+        });
+        setTimeout(() => {
+          onSuccess({ ...applyRes.application, status: 'opened_in_gmail', deliveryStatus: 'opened_in_gmail' });
+        }, 1600);
+      }
+    } catch (err: any) {
+      console.warn('Could not record opened_in_gmail:', err);
+    }
+  };
+
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!recipientEmail.trim()) {
       setError(
         'Recipient email address is required. If the company only accepts applications through their portal, please apply via the portal link.',
+      );
+      return;
+    }
+
+    if (isDummyDomain(recipientEmail)) {
+      setError(
+        `"${recipientEmail}" is a placeholder address (company.com/example.com). Real emails cannot be delivered to dummy domains. Please apply via the official company portal link below or provide a real company contact email.`
       );
       return;
     }
@@ -228,11 +294,20 @@ export const EmailApplicationModal: React.FC<EmailApplicationModalProps> = ({
       });
 
       if (res.ok) {
+        const statusLabel =
+          res.deliveryStatus === 'failed'
+            ? 'Delivery Failed'
+            : res.deliveryStatus === 'accepted_by_provider'
+            ? 'Accepted by Email Provider (SMTP)'
+            : res.deliveryStatus === 'draft_created'
+            ? 'Draft Created (SMTP Unconfigured)'
+            : 'Successfully Sent';
+
         setSentSuccess({
           recipient: recipientEmail.trim(),
           sender: senderEmail.trim(),
           date: new Date().toLocaleString(),
-          status: res.deliveryStatus === 'failed' ? 'Failed' : 'Successfully Sent',
+          status: statusLabel,
           attachedResume: selectedAttachmentName || 'None',
         });
         setTimeout(() => {
@@ -618,18 +693,39 @@ export const EmailApplicationModal: React.FC<EmailApplicationModalProps> = ({
                           setVerificationStatus('verified');
                         }
                       }}
-                      placeholder="e.g. careers@company.com"
+                      placeholder="e.g. jobs@employer.com or hr@employer.org"
                       required
                       style={{
                         width: '100%',
                         padding: '9px 12px',
                         borderRadius: 8,
-                        border: '1px solid #cbd5e1',
+                        border: isDummyDomain(recipientEmail) ? '1px solid #ef4444' : '1px solid #cbd5e1',
                         fontSize: '13px',
-                        background: '#fff',
+                        background: isDummyDomain(recipientEmail) ? '#fef2f2' : '#fff',
                         fontWeight: 600,
                       }}
                     />
+                    {isDummyDomain(recipientEmail) && (
+                      <div
+                        style={{
+                          marginTop: 6,
+                          padding: '6px 10px',
+                          background: '#fef2f2',
+                          border: '1px solid #fecaca',
+                          borderRadius: 6,
+                          fontSize: '11.5px',
+                          color: '#b91c1c',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 6,
+                        }}
+                      >
+                        <AlertTriangle size={14} color="#dc2626" />
+                        <span>
+                          <strong>Placeholder Domain:</strong> "{recipientEmail}" is an example domain with no active mail servers. Emails sent to it will bounce.
+                        </span>
+                      </div>
+                    )}
                     {alternativeEmails.length > 0 && (
                       <div style={{ marginTop: 6, fontSize: '11px', color: '#475569', display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
                         <span>Other discovered addresses:</span>
@@ -1017,6 +1113,8 @@ export const EmailApplicationModal: React.FC<EmailApplicationModalProps> = ({
                   alignItems: 'center',
                   paddingTop: 10,
                   borderTop: '1px solid #e2e8f0',
+                  flexWrap: 'wrap',
+                  gap: 10,
                 }}
               >
                 <button
@@ -1037,33 +1135,58 @@ export const EmailApplicationModal: React.FC<EmailApplicationModalProps> = ({
                   Cancel
                 </button>
 
-                <button
-                  type="submit"
-                  disabled={sending}
-                  style={{
-                    background: '#2563eb',
-                    color: '#fff',
-                    border: 'none',
-                    padding: '10px 24px',
-                    borderRadius: 8,
-                    fontSize: '13px',
-                    fontWeight: 700,
-                    cursor: sending ? 'not-allowed' : 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 6,
-                  }}
-                >
-                  {sending ? (
-                    <>
-                      <Loader2 size={16} className="spin" /> Sending Application…
-                    </>
-                  ) : (
-                    <>
-                      <Send size={15} /> Send Verified Application
-                    </>
-                  )}
-                </button>
+                <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                  <button
+                    type="button"
+                    onClick={() => void handleOpenInGmail()}
+                    disabled={sending || !recipientEmail || isDummyDomain(recipientEmail)}
+                    style={{
+                      background: '#ffffff',
+                      color: '#ea4335',
+                      border: '1px solid #fecaca',
+                      padding: '10px 18px',
+                      borderRadius: 8,
+                      fontSize: '13px',
+                      fontWeight: 700,
+                      cursor: sending || !recipientEmail || isDummyDomain(recipientEmail) ? 'not-allowed' : 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      opacity: !recipientEmail || isDummyDomain(recipientEmail) ? 0.6 : 1,
+                    }}
+                    title="Open formatted application in your Gmail web compose window"
+                  >
+                    <Mail size={15} /> Open in Gmail
+                  </button>
+
+                  <button
+                    type="submit"
+                    disabled={sending || !recipientEmail || isDummyDomain(recipientEmail)}
+                    style={{
+                      background: isDummyDomain(recipientEmail) ? '#94a3b8' : '#2563eb',
+                      color: '#fff',
+                      border: 'none',
+                      padding: '10px 24px',
+                      borderRadius: 8,
+                      fontSize: '13px',
+                      fontWeight: 700,
+                      cursor: sending || !recipientEmail || isDummyDomain(recipientEmail) ? 'not-allowed' : 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                    }}
+                  >
+                    {sending ? (
+                      <>
+                        <Loader2 size={16} className="spin" /> Sending Application…
+                      </>
+                    ) : (
+                      <>
+                        <Send size={15} /> Send Verified Application
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
             </form>
           )}

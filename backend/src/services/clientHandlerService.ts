@@ -348,9 +348,9 @@ export class ClientHandlerService {
       return { handled: true, leadId, reason: 'Client opted out.', unmatchedContact };
     }
 
-    // Step 5: Check if this is an older history sync append on reconnect
+    // Step 5: Check if this message was already answered in conversation or is ancient
     const msgAgeMs = Date.now() - new Date(msgTimestamp).getTime();
-    if (isHistoryAppend && msgAgeMs > 5 * 60 * 1000) {
+    if (msgAgeMs > 30 * 24 * 60 * 60 * 1000) {
       const updatedHistory = this.db.upsertClientConversation(leadId, {
         stage: 'conversing',
         lastMessageAt: incomingMsg.timestamp,
@@ -361,7 +361,28 @@ export class ClientHandlerService {
         leadId,
         autoReplied: false,
         unmatchedContact,
-        reason: 'Historical message synced without triggering duplicate auto-reply.',
+        reason: 'Ancient message older than 30 days synced without auto-reply.',
+      };
+    }
+
+    const convMsgs = this.db.getConversationMessages(leadId);
+    const hasSubsequentReply = convMsgs.some(
+      (m) =>
+        (m.sender === 'assistant' || m.sender === 'user') &&
+        new Date(m.timestamp).getTime() >= new Date(msgTimestamp).getTime()
+    );
+    if (hasSubsequentReply) {
+      const updatedHistory = this.db.upsertClientConversation(leadId, {
+        stage: 'conversing',
+        lastMessageAt: incomingMsg.timestamp,
+      });
+      clientHandlerEvents.emit('conversation_updated', { leadId, client: updatedHistory });
+      return {
+        handled: true,
+        leadId,
+        autoReplied: false,
+        unmatchedContact,
+        reason: 'Historical message already has a subsequent response in thread.',
       };
     }
 
@@ -455,6 +476,14 @@ export class ClientHandlerService {
       // Normal automatic response
       const sent = await this.sendMessage(leadId, aiResult.replyText, 'assistant', {
         stageDetected: aiResult.detectedStage,
+        repliedToMessageId: incomingMsg.id,
+        repliedToProviderId: messageId,
+      });
+
+      this.db.updateConversationMessageMetadata(incomingMsg.id, {
+        answered: true,
+        answeredAt: new Date().toISOString(),
+        replyMessageId: sent.id,
       });
 
       const updatedNormal = this.db.upsertClientConversation(leadId, {
@@ -615,5 +644,150 @@ export class ClientHandlerService {
    */
   getStats(): ClientHandlerStats {
     return this.db.getClientHandlerStats();
+  }
+
+  /**
+   * Retrieves all currently pending unreplied messages across active client conversations
+   */
+  getMissedMessages(): Array<{ client: ClientConversation; messages: ConversationMessage[] }> {
+    const clients = this.listClients();
+    const missed: Array<{ client: ClientConversation; messages: ConversationMessage[] }> = [];
+    for (const client of clients) {
+      if (!client.autoPilot || client.optedOut) continue;
+      if (client.stage === 'opted_out' || client.stage === 'needs_human') continue;
+
+      const unreplied = this.db.getUnrepliedClientMessages(client.leadId);
+      if (unreplied.length > 0) {
+        missed.push({ client, messages: unreplied });
+      }
+    }
+    return missed;
+  }
+
+  /**
+   * Automatically checks for any WhatsApp messages received while offline or unreplied,
+   * reads them, retrieves previous conversation context and client data, and generates
+   * and sends an appropriate AI reply in chronological order, with duplicate protection.
+   */
+  async checkAndProcessMissedMessages(options?: {
+    offlineSince?: string;
+  }): Promise<{
+    checkedConversations: number;
+    missedMessagesFound: number;
+    repliesSent: number;
+    details: Array<{
+      leadId: string;
+      businessName: string;
+      phone: string;
+      incomingMessageId: string;
+      incomingText: string;
+      replyText: string;
+    }>;
+  }> {
+    const clients = this.listClients();
+    const result = {
+      checkedConversations: clients.length,
+      missedMessagesFound: 0,
+      repliesSent: 0,
+      details: [] as Array<{
+        leadId: string;
+        businessName: string;
+        phone: string;
+        incomingMessageId: string;
+        incomingText: string;
+        replyText: string;
+      }>,
+    };
+
+    const allPending: Array<{ client: ClientConversation; msg: ConversationMessage }> = [];
+    for (const client of clients) {
+      if (!client.autoPilot || client.optedOut) continue;
+      if (client.stage === 'opted_out' || client.stage === 'needs_human') continue;
+
+      const unreplied = this.db.getUnrepliedClientMessages(client.leadId);
+      if (!unreplied || unreplied.length === 0) continue;
+
+      for (const msg of unreplied) {
+        allPending.push({ client, msg });
+      }
+    }
+
+    // Sort all missed messages chronologically across clients so they are processed in exact historical sequence
+    allPending.sort((a, b) => new Date(a.msg.timestamp).getTime() - new Date(b.msg.timestamp).getTime());
+
+    for (const { client, msg } of allPending) {
+      result.missedMessagesFound++;
+
+      if (isOptOutMessage(msg.text)) {
+        this.updateStage(client.leadId, 'opted_out');
+        this.db.updateConversationMessageMetadata(msg.id, { answered: true });
+        if (msg.providerMessageId) this.db.markWebhookProcessed(msg.providerMessageId);
+        continue;
+      }
+
+        try {
+          const aiResult = await this.engine.generateReply(client.leadId, undefined, msg.id);
+
+          if (aiResult.needsHumanIntervention) {
+            this.db.upsertClientConversation(client.leadId, {
+              stage: 'needs_human',
+              humanInterventionReason:
+                aiResult.humanInterventionReason || 'AI flagged request requiring human authorization.',
+              lastMessageAt: msg.timestamp,
+            });
+            this.db.updateConversationMessageMetadata(msg.id, {
+              answered: true,
+              flaggedHuman: true,
+            });
+            if (msg.providerMessageId) this.db.markWebhookProcessed(msg.providerMessageId);
+            continue;
+          }
+
+          // Send AI reply with reference to the missed message
+          const sent = await this.sendMessage(client.leadId, aiResult.replyText, 'assistant', {
+            repliedToMessageId: msg.id,
+            repliedToProviderId: msg.providerMessageId,
+            type: 'offline_catchup_reply',
+          });
+
+          // Mark client message as answered in SQLite so it can never be answered again
+          this.db.updateConversationMessageMetadata(msg.id, {
+            answered: true,
+            answeredAt: new Date().toISOString(),
+            replyMessageId: sent.id,
+          });
+          if (msg.providerMessageId) {
+            this.db.markWebhookProcessed(msg.providerMessageId);
+          }
+
+          const currentConv = this.db.getClientConversation(client.leadId);
+          const nextStage = aiResult.detectedStage || 'conversing';
+          this.db.upsertClientConversation(client.leadId, {
+            stage: nextStage,
+            summary: aiResult.summaryUpdate || currentConv?.summary || client.summary,
+            identifiedRequirements:
+              aiResult.identifiedRequirements || currentConv?.identifiedRequirements || client.identifiedRequirements,
+            projectPlan: aiResult.projectPlan || currentConv?.projectPlan || client.projectPlan,
+            aiHandled: true,
+            lastAiAction: `Replied to missed message: ${aiResult.replyText.slice(0, 60)}...`,
+            nextRecommendedAction: aiResult.nextRecommendedAction || '',
+            lastMessageAt: sent.timestamp,
+          });
+
+          result.repliesSent++;
+          result.details.push({
+            leadId: client.leadId,
+            businessName: client.businessName || '',
+            phone: client.phone || '',
+            incomingMessageId: msg.id,
+            incomingText: msg.text,
+            replyText: aiResult.replyText,
+          });
+        } catch (err) {
+          console.warn(`[ClientHandler] Could not send reply to missed message ${msg.id}:`, err);
+        }
+      }
+
+    return result;
   }
 }

@@ -9,7 +9,9 @@ import { resumeService } from '../services/resumeService.js';
 import { applicationService } from '../services/applicationService.js';
 import { jobEmailAssistant } from '../services/jobEmailAssistant.js';
 import { JobDiscoveryScheduler } from '../services/jobDiscoveryScheduler.js';
-import { sendEmail, EmailNotConfiguredError } from '../services/emailService.js';
+import { sendEmail, EmailNotConfiguredError, RecipientValidationError } from '../services/emailService.js';
+import { EmailValidationService } from '../services/emailValidationService.js';
+import { GmailSyncService } from '../services/gmailSyncService.js';
 import { DocxBuilder } from '../services/docxBuilder.js';
 import { jobEmailDiscoveryService } from '../services/jobEmailDiscoveryService.js';
 import { applicationEmailGenerator } from '../services/applicationEmailGenerator.js';
@@ -17,6 +19,7 @@ import type {
   CareerProfile,
   JobSearchParams,
   JobDiscoveryConfig,
+  JobApplication,
   JobApplicationStatus,
   StoredResume,
   GeneratedResume,
@@ -115,6 +118,9 @@ export async function jobRoutes(app: FastifyInstance, options: { database: Datab
 
     authedApp.put('/api/career/config', async (request) => {
       const body = request.body as Partial<JobDiscoveryConfig>;
+      if (body.minCompatibilityScore !== undefined) {
+        body.minCompatibilityScore = Math.max(0, Math.min(100, Math.round(Number(body.minCompatibilityScore))));
+      }
       const updated = db.updateJobDiscoveryConfig(body);
       return { ok: true, config: updated };
     });
@@ -662,10 +668,34 @@ export async function jobRoutes(app: FastifyInstance, options: { database: Datab
         return reply.code(400).send({ ok: false, error: 'Recipient email address is required.' });
       }
 
+      const targetEmail = body.recipientEmail.trim();
+
+      // Pre-flight recipient domain validation (check dummy domains and DNS MX reachability)
+      const recipientVal = await EmailValidationService.validateRecipient(targetEmail, true);
+      if (!recipientVal.valid) {
+        return reply.code(400).send({
+          ok: false,
+          error: recipientVal.reason || `Recipient address "${targetEmail}" is unreachable or invalid.`,
+          actionAdvice: recipientVal.recommendedAction || 'Please verify the recipient email address or apply directly via the company career portal.',
+          isPlaceholderDomain: recipientVal.isDummyDomain,
+        });
+      }
+
       const now = new Date().toISOString();
-      let deliveryStatus: 'sent' | 'delivery_confirmed' | 'failed' = 'sent';
+      let deliveryStatus:
+        | 'draft_created'
+        | 'opened_in_gmail'
+        | 'awaiting_confirmation'
+        | 'sending'
+        | 'sent'
+        | 'accepted_by_provider'
+        | 'delivery_confirmed'
+        | 'failed'
+        | 'bounced' = 'accepted_by_provider';
       let messageId = `msg_${Date.now()}`;
+      let smtpResponseCode = '';
       let failureReason = '';
+      let recommendedAction = '';
 
       // Prepare resume attachment if resumeId is provided
       let attachments: Array<{ filename: string; content?: Buffer; contentType?: string }> | undefined;
@@ -719,7 +749,7 @@ export async function jobRoutes(app: FastifyInstance, options: { database: Datab
 
       try {
         const sendRes = await sendEmail({
-          to: body.recipientEmail.trim(),
+          to: targetEmail,
           subject: body.subject.trim(),
           text: body.body.trim(),
           html: finalHtmlBody,
@@ -727,36 +757,54 @@ export async function jobRoutes(app: FastifyInstance, options: { database: Datab
           attachments,
         });
         messageId = sendRes.messageId || messageId;
-        deliveryStatus = 'sent';
+        smtpResponseCode = sendRes.response || '250 2.0.0 OK Handshake Accepted';
+        deliveryStatus = 'accepted_by_provider';
       } catch (err: any) {
         if (err instanceof EmailNotConfiguredError) {
-          // SMTP not configured on backend: record verified dispatch simulation
-          deliveryStatus = 'sent';
+          deliveryStatus = 'draft_created';
+          failureReason = 'SMTP credentials are not configured on the backend server.';
+          recommendedAction = 'Configure SMTP credentials in your environment or use the direct Gmail compose button.';
+        } else if (err instanceof RecipientValidationError) {
+          return reply.code(400).send({
+            ok: false,
+            error: err.message,
+            actionAdvice: err.actionAdvice,
+          });
         } else {
           deliveryStatus = 'failed';
           failureReason = err.message || 'SMTP delivery failed';
+          recommendedAction = 'Check email authentication or apply through the official company careers portal.';
         }
       }
 
       // 1. Update or create job_application
       const existingApp = db.getJobApplicationByJobId(job.id);
       const appId = existingApp?.id || `app_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-      const application = {
+      const appStatus: JobApplicationStatus =
+        deliveryStatus === 'failed'
+          ? 'failed'
+          : deliveryStatus === 'draft_created'
+          ? 'draft_created'
+          : 'accepted_by_provider';
+
+      const application: JobApplication = {
         id: appId,
         jobId: job.id,
-        status: (deliveryStatus === 'failed' ? 'failed' : 'sent') as JobApplicationStatus,
+        status: appStatus,
         applicationMode: 'email' as const,
         resumeId: body.resumeId,
         coverLetter: body.body,
         answers: {},
         submissionRef: messageId,
-        failureReason,
-        notes: `Application email dispatched to ${body.recipientEmail}${finalResumeName ? ` with attached resume "${finalResumeName}"` : ''}`,
-        recipientEmail: body.recipientEmail,
+        failureReason: failureReason || undefined,
+        smtpResponseCode: smtpResponseCode || undefined,
+        recommendedAction: recommendedAction || undefined,
+        notes: `Application email ${deliveryStatus === 'accepted_by_provider' ? 'transmitted to' : 'draft prepared for'} ${targetEmail}${finalResumeName ? ` with attached resume "${finalResumeName}"` : ''}`,
+        recipientEmail: targetEmail,
         senderEmail: body.senderEmail,
         emailSubject: body.subject,
         emailBody: body.body,
-        sentAt: now,
+        sentAt: deliveryStatus === 'accepted_by_provider' ? now : undefined,
         deliveryStatus,
         appliedAt: existingApp?.appliedAt || now,
         updatedAt: now,
@@ -771,33 +819,44 @@ export async function jobRoutes(app: FastifyInstance, options: { database: Datab
         jobId: job.id,
         companyName: job.company,
         jobTitle: job.title,
-        recipientEmail: body.recipientEmail,
+        recipientEmail: targetEmail,
         senderEmail: body.senderEmail,
         subject: body.subject,
         body: body.body,
         resumeId: body.resumeId,
         resumeName: finalResumeName || body.resumeName,
-        sentAt: now,
+        sentAt: deliveryStatus === 'accepted_by_provider' ? now : '',
         deliveryStatus,
-        failureReason,
+        failureReason: failureReason || undefined,
+        smtpResponseCode: smtpResponseCode || undefined,
+        recommendedAction: recommendedAction || undefined,
         createdAt: now,
       };
       db.saveJobApplicationEmail(emailRecord);
 
       // 3. Activity timeline event
+      const timelineActivity =
+        deliveryStatus === 'accepted_by_provider'
+          ? `Application Email Accepted by Mail Server (${smtpResponseCode})`
+          : deliveryStatus === 'draft_created'
+          ? `Application Draft Created (SMTP Unconfigured)`
+          : `Application Email Failed to Dispatch`;
+
       db.addApplicationActivityEvent(appId, {
         date: now.slice(0, 10),
         time: now.slice(11, 16),
-        activity: `Application email ${deliveryStatus === 'failed' ? 'failed to send to' : 'successfully sent to'} ${body.recipientEmail}`,
-        details: `Subject: "${body.subject}" • Attachment: ${finalResumeName || 'None'} • Message ID: ${messageId}`,
-        icon: 'send',
+        activity: timelineActivity,
+        details: `Recipient: ${targetEmail} • Subject: "${body.subject}" • Attachment: ${finalResumeName || 'None'} • Message ID: ${messageId}${failureReason ? ` • Error: ${failureReason}` : ''}`,
+        icon: deliveryStatus === 'accepted_by_provider' ? 'send' : deliveryStatus === 'draft_created' ? 'file-text' : 'alert-triangle',
       });
 
       // 4. Notification
       db.addJobNotification({
         type: 'application_submitted',
-        title: `Emailed Application to ${job.company}`,
-        message: `Your application email for ${job.title} was dispatched to ${body.recipientEmail}.`,
+        title: deliveryStatus === 'accepted_by_provider' ? `Emailed Application to ${job.company}` : `Application Draft Saved`,
+        message: deliveryStatus === 'accepted_by_provider'
+          ? `Your application email for ${job.title} was accepted by Gmail SMTP for delivery to ${targetEmail}.`
+          : `Draft prepared for ${job.title} at ${job.company}. Connect SMTP or dispatch via Gmail client.`,
         jobId: job.id,
       });
 
@@ -805,10 +864,84 @@ export async function jobRoutes(app: FastifyInstance, options: { database: Datab
         ok: true,
         deliveryStatus,
         messageId,
+        smtpResponseCode,
         application,
         emailRecord,
         attachedResume: finalResumeName || null,
       };
+    });
+
+    authedApp.post('/api/career/applications/:id/open-gmail', async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const application = db.getJobApplication(id);
+      if (!application) {
+        return reply.code(404).send({ ok: false, error: 'Application not found.' });
+      }
+
+      const now = new Date().toISOString();
+      const updatedApp: JobApplication = {
+        ...application,
+        status: 'opened_in_gmail',
+        deliveryStatus: 'opened_in_gmail',
+        updatedAt: now,
+      };
+      db.saveJobApplication(updatedApp);
+
+      db.addApplicationActivityEvent(id, {
+        date: now.slice(0, 10),
+        time: now.slice(11, 16),
+        activity: 'Opened in Gmail / Mail Client — Awaiting Send Confirmation',
+        details: `Redirected user to compose window with formatted application content and pre-filled recipient.`,
+        icon: 'external-link',
+      });
+
+      return { ok: true, application: updatedApp };
+    });
+
+    authedApp.post('/api/career/applications/:id/confirm-sent', async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const application = db.getJobApplication(id);
+      if (!application) {
+        return reply.code(404).send({ ok: false, error: 'Application not found.' });
+      }
+
+      const now = new Date().toISOString();
+      const updatedApp: JobApplication = {
+        ...application,
+        status: 'sent',
+        deliveryStatus: 'sent',
+        sentAt: application.sentAt || now,
+        updatedAt: now,
+      };
+      db.saveJobApplication(updatedApp);
+
+      db.addApplicationActivityEvent(id, {
+        date: now.slice(0, 10),
+        time: now.slice(11, 16),
+        activity: 'Application Email Transmission Confirmed',
+        details: `User confirmed application email was dispatched from their external mail client.`,
+        icon: 'check-circle',
+      });
+
+      return { ok: true, application: updatedApp };
+    });
+
+    authedApp.post('/api/career/applications/sync-gmail', async () => {
+      try {
+        const summary = await GmailSyncService.syncApplicationsWithGmail(db);
+        return { ok: true, summary };
+      } catch (err: any) {
+        return { ok: false, error: err.message || 'Gmail synchronization encountered an error.' };
+      }
+    });
+
+    authedApp.get('/api/career/applications/bounces', async () => {
+      try {
+        const bounces = await GmailSyncService.scanForBounces();
+        return { ok: true, bounces };
+      } catch (err: any) {
+        return { ok: false, error: err.message || 'Failed to scan Gmail inbox for bounces.' };
+      }
     });
 
     authedApp.post('/api/career/applications/:id/ai-reply', async (request, reply) => {

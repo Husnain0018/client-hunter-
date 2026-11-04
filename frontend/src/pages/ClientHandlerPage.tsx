@@ -431,6 +431,15 @@ export const ClientHandlerPage: React.FC<ClientHandlerPageProps> = ({
         setMessages((prev) =>
           prev.map((m) => (m.providerMessageId === evt.providerMessageId ? { ...m, status: evt.status } : m))
         );
+        setSelectedClient((prev) => {
+          if (!prev || (evt.leadId && prev.leadId !== evt.leadId)) return prev;
+          return {
+            ...prev,
+            messages: prev.messages?.map((m) =>
+              m.providerMessageId === evt.providerMessageId ? { ...m, status: evt.status } : m
+            ),
+          };
+        });
       }
     });
     return () => unsubscribe();
@@ -1552,13 +1561,55 @@ export const ClientHandlerPage: React.FC<ClientHandlerPageProps> = ({
                                 })}
                               </span>
                               {!isClient && (
-                                <span title={`Delivery Status: ${m.status}`}>
+                                <span
+                                  title={
+                                    m.status === 'Read' || m.status === 'Played'
+                                      ? 'Read by client'
+                                      : m.status === 'Delivered'
+                                      ? 'Delivered to client device'
+                                      : m.status === 'Sent'
+                                      ? 'Sent to WhatsApp server'
+                                      : m.status === 'Sending' || m.status === 'Pending'
+                                      ? 'Sending message...'
+                                      : m.status === 'Failed'
+                                      ? 'Delivery failed'
+                                      : `WhatsApp status: ${m.status}`
+                                  }
+                                  style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}
+                                >
                                   {m.status === 'Read' || m.status === 'Played' ? (
                                     <CheckCheck size={13} style={{ color: '#0ea5e9' }} />
                                   ) : m.status === 'Delivered' ? (
-                                    <CheckCheck size={13} />
+                                    <CheckCheck size={13} style={{ color: '#94a3b8' }} />
+                                  ) : m.status === 'Sent' ? (
+                                    <Check size={13} style={{ color: '#94a3b8' }} />
+                                  ) : m.status === 'Sending' || m.status === 'Pending' ? (
+                                    <Clock size={12} style={{ color: '#94a3b8', opacity: 0.8 }} />
+                                  ) : m.status === 'Failed' ? (
+                                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, color: '#ef4444', fontSize: '11px', fontWeight: 600 }}>
+                                      <AlertCircle size={12} /> Failed
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setInputMessage(m.text);
+                                        }}
+                                        title="Click to paste message into input and retry"
+                                        style={{
+                                          background: 'rgba(239, 68, 68, 0.15)',
+                                          border: '1px solid rgba(239, 68, 68, 0.3)',
+                                          color: '#ef4444',
+                                          borderRadius: 4,
+                                          padding: '1px 5px',
+                                          fontSize: '10px',
+                                          cursor: 'pointer',
+                                          marginLeft: 3,
+                                        }}
+                                      >
+                                        <RefreshCw size={9} style={{ display: 'inline', marginRight: 2 }} /> Retry
+                                      </button>
+                                    </span>
                                   ) : (
-                                    <Check size={13} />
+                                    <Check size={13} style={{ color: '#94a3b8' }} />
                                   )}
                                 </span>
                               )}

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Database } from '../db/database.js';
+import { EmailValidationService } from './emailValidationService.js';
 import type {
   EmploymentType,
   ExperienceLevel,
@@ -770,8 +771,18 @@ export class JobSourceService {
   }
 
   private extractContactEmail(desc: string): string {
-    const match = desc.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
-    return match ? match[0] : '';
+    const matches = desc.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
+    for (const raw of matches) {
+      const clean = raw.trim().toLowerCase();
+      const [localPart, domain] = clean.split('@');
+      if (!localPart || !domain) continue;
+      if (EmailValidationService.isDummyOrPlaceholderDomain(domain)) continue;
+      if (EmailValidationService.isBlockedPrefix(localPart)) continue;
+      // Exclude asset file extensions
+      if (/\.(png|jpg|jpeg|gif|svg|webp|ico|css|js|woff|ttf|pdf)$/i.test(clean)) continue;
+      return clean;
+    }
+    return '';
   }
 
   private stripHtml(html: string): string {

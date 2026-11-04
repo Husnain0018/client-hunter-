@@ -88,21 +88,43 @@ export const ApplicationTimelineModal: React.FC<ApplicationTimelineModalProps> =
         <div style={{ padding: '24px' }}>
           {/* Email Info Strip if sent via email */}
           {application.recipientEmail && (
-            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 10, padding: '12px 16px', marginBottom: 20, fontSize: '12px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 10, padding: '14px 16px', marginBottom: 20, fontSize: '12px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
                 <span style={{ color: '#64748b' }}>Recipient:</span>
                 <strong style={{ color: '#0f172a' }}>{application.recipientEmail}</strong>
               </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
                 <span style={{ color: '#64748b' }}>Sender:</span>
                 <strong style={{ color: '#0f172a' }}>{application.senderEmail || 'Authorized Account'}</strong>
               </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
                 <span style={{ color: '#64748b' }}>Delivery Status:</span>
-                <strong style={{ color: application.status === 'failed' ? '#dc2626' : '#16a34a' }}>
+                <strong
+                  style={{
+                    color:
+                      application.status === 'failed' || application.status === 'bounced' || application.status === 'rejected'
+                        ? '#dc2626'
+                        : application.status === 'opened_in_gmail' || application.status === 'awaiting_confirmation' || application.status === 'draft_created'
+                        ? '#d97706'
+                        : application.status === 'accepted_by_provider'
+                        ? '#2563eb'
+                        : '#16a34a',
+                  }}
+                >
                   ● {application.deliveryStatus || application.status.replace(/_/g, ' ').toUpperCase()}
                 </strong>
               </div>
+
+              {application.failureReason && (
+                <div style={{ marginTop: 8, padding: '8px 10px', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, color: '#b91c1c', fontSize: '11.5px' }}>
+                  <strong>Failure / Bounce Details:</strong> {application.failureReason}
+                  {application.recommendedAction && (
+                    <div style={{ marginTop: 4, color: '#991b1b' }}>
+                      <strong>Recommended Action:</strong> {application.recommendedAction}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 

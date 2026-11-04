@@ -6,6 +6,7 @@ import type {
   JobApplicationStatus
 } from '../types/domain.js';
 import type { Database } from '../db/database.js';
+import { EmailValidationService } from './emailValidationService.js';
 
 export interface ApplicationPackage {
   job: JobListing;
@@ -129,30 +130,52 @@ ${profile?.portfolioLinks?.[0] || ''}`.trim();
       };
     }
 
-    const initialStatus: JobApplicationStatus = 'submitted';
+    const contactEmail = job.contactEmail || '';
+    const hasVerifiedEmail =
+      Boolean(contactEmail) &&
+      !EmailValidationService.isDummyOrPlaceholderDomain(contactEmail.split('@')[1] || '') &&
+      !EmailValidationService.isBlockedPrefix(contactEmail.split('@')[0] || '');
+
     const coverLetter = this.generateCoverLetter(profile, job);
     const answers = this.generateApplicationAnswers(profile, job);
+    const now = new Date().toISOString();
 
     const appId = `app_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const application: JobApplication = {
       id: appId,
       jobId: job.id,
-      status: initialStatus,
+      status: 'submitted',
       applicationMode: 'automatic',
       coverLetter,
       answers,
       submissionRef: `AUTO-${Date.now()}`,
-      appliedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+      recipientEmail: hasVerifiedEmail ? job.contactEmail : undefined,
+      notes: hasVerifiedEmail
+        ? `Auto-applied with verified recruitment email (${job.contactEmail}).`
+        : `Auto-apply prepared tailored application package. Requires direct submission on official employer portal: ${job.applyUrl || 'company careers page'}.`,
+      appliedAt: now,
+      updatedAt: now,
     };
 
     db.saveJobApplication(application);
 
+    db.addApplicationActivityEvent(appId, {
+      date: now.slice(0, 10),
+      time: now.slice(11, 16),
+      activity: hasVerifiedEmail ? 'Auto-Application Processed' : 'Auto-Application Package Prepared for Portal',
+      details: hasVerifiedEmail
+        ? `Queued for ${job.company} via verified recruitment contact: ${job.contactEmail} (Match Score: ${matchScore}%).`
+        : `Tailored answers and cover letter prepared for official portal: ${job.applyUrl || 'Career page'}.`,
+      icon: hasVerifiedEmail ? 'send' : 'external-link',
+    });
+
     db.addJobNotification({
       type: 'application_submitted',
-      title: `Auto-Applied: ${job.title} at ${job.company}`,
-      message: `Successfully queued and applied to ${job.company} (Match Score: ${matchScore}%).`,
-      jobId: job.id
+      title: hasVerifiedEmail ? `Auto-Applied: ${job.company}` : `Auto-Application Prepared: ${job.company}`,
+      message: hasVerifiedEmail
+        ? `Application package queued for ${job.title} at ${job.company} (${matchScore}% match).`
+        : `Tailored cover letter and answers ready for ${job.title}. Apply directly via their careers portal.`,
+      jobId: job.id,
     });
 
     return { success: true, application };

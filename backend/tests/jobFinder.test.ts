@@ -521,14 +521,31 @@ describe('AI Job Finder & Career Assistant Backend', () => {
       expect(renderRes.json().html).toContain('Custom Subject Line for Application');
       expect(renderRes.json().html).toContain('Reduced API latency by 45%');
 
-      // 12. Send Email with Resume Attachment
-      const sendRes = await app.inject({
+      // 12. Send Email - Verify dummy email rejection & valid verified send
+      const dummyRes = await app.inject({
         method: 'POST',
         url: '/api/career/applications/send-email',
         headers: authHeaders,
         payload: {
           jobId: firstJob.id,
           recipientEmail: 'careers@company.com',
+          senderEmail: 'ahmad@example.com',
+          subject: 'Application for Engineer',
+          body: 'Please review my resume attached.',
+          bodyEdited: true,
+          resumeId: genResume.id,
+        }
+      });
+      expect(dummyRes.statusCode).toBe(400);
+      expect(dummyRes.json().error).toContain('company.com');
+
+      const sendRes = await app.inject({
+        method: 'POST',
+        url: '/api/career/applications/send-email',
+        headers: authHeaders,
+        payload: {
+          jobId: firstJob.id,
+          recipientEmail: 'careers@duckduckgo.com',
           senderEmail: 'ahmad@example.com',
           subject: 'Application for Engineer',
           body: 'Please review my resume attached.',

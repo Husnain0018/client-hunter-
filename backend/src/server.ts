@@ -68,6 +68,9 @@ export function buildApp(customDatabase?: Database) {
   app.register(jobRoutes, { database });
   app.addHook('onClose', async () => {
     try {
+      database.setLastActiveTimestamp();
+    } catch {}
+    try {
       await BaileysManager.getInstance(database).disconnect();
     } catch {
       // ignore
@@ -93,8 +96,28 @@ process.on('unhandledRejection', (reason) => {
 if (process.env.NODE_ENV !== 'test') {
   const database = new Database(env.databasePath);
   const app = buildApp(database);
+  app.ready((err) => {
+    if (err) {
+      console.error('FASTIFY READY ERROR:', err);
+      process.exit(1);
+    }
+  });
   app.listen({ host: env.HOST, port: env.PORT }).then(() => {
     app.log.info(`Client Hunter backend listening on http://${env.HOST}:${env.PORT}`);
+
+    const lastActive = database.getLastActiveTimestamp();
+    if (lastActive) {
+      app.log.info(`[WhatsApp] System reopened. Offline since: ${lastActive}. Checking for missed messages...`);
+    }
+    database.setLastActiveTimestamp();
+
+    // Periodic heartbeat to track when the system was last online
+    const heartbeat = setInterval(() => {
+      try {
+        database.setLastActiveTimestamp();
+      } catch {}
+    }, 15_000);
+    heartbeat.unref();
 
     // Auto-resume saved WhatsApp session if credentials exist
     if (hasSavedSession(database)) {
@@ -107,6 +130,9 @@ if (process.env.NODE_ENV !== 'test') {
     const gracefulShutdown = async (signal: string) => {
       app.log.info(`Received ${signal}, closing server and WhatsApp connection cleanly...`);
       try {
+        database.setLastActiveTimestamp();
+      } catch {}
+      try {
         await BaileysManager.getInstance(database).destroy();
       } catch {}
       try {
@@ -118,6 +144,7 @@ if (process.env.NODE_ENV !== 'test') {
     process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
     process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
   }).catch((error) => {
+    console.error('SERVER LISTEN FAILED ERROR:', error);
     app.log.error(error);
     process.exit(1);
   });

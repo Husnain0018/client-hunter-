@@ -7,6 +7,7 @@ import { RunPipeline } from '../services/runPipeline.js';
 import { sendEmail, EmailNotConfiguredError } from '../services/emailService.js';
 import { connectSheet } from '../services/googleSheetsSync.js';
 import { BaileysManager } from '../services/baileysManager.js';
+import { clientHandlerEvents } from '../services/clientHandlerService.js';
 
 const requestSchema = z.object({
   userName: z.string().trim().min(1).max(120),
@@ -165,6 +166,19 @@ export async function apiRoutes(app: FastifyInstance, options: ApiRouteOptions):
       const result = await baileys.sendTextMessage(number, parsed.data.message);
       const record = database.updateWhatsApp(leadId, { status: result.status, providerMessageId: result.providerMessageId });
       database.updateLead(leadId, { whatsappStatus: result.status, whatsappRunId: result.providerMessageId });
+
+      // Real-time broadcast to Client Handler SSE stream
+      const client = database.getClientConversation(leadId);
+      const convMsgs = database.getConversationMessages(leadId);
+      const lastMsg = convMsgs[convMsgs.length - 1];
+      if (client && lastMsg) {
+        clientHandlerEvents.emit('message_sent', {
+          leadId,
+          message: lastMsg,
+          client,
+        });
+      }
+
       return { ok: true, record };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'WhatsApp could not be sent.';
@@ -179,10 +193,5 @@ export async function apiRoutes(app: FastifyInstance, options: ApiRouteOptions):
     const leadId = String((request.params as { leadId: string }).leadId);
     const record = database.getWhatsApp(leadId);
     return { ok: true, record: record || { status: 'Not sent', leadId } };
-  });
-
-  app.post('/api/webhooks/waha/ack', async () => {
-    // Legacy WAHA endpoint retained for backwards compatibility
-    return { ok: true, ignored: true };
   });
 }

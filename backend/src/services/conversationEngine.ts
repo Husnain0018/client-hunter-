@@ -171,12 +171,12 @@ export class ConversationEngine {
   /**
    * Generates the next response to an incoming client message or user trigger
    */
-  async generateReply(leadId: string, userGuidance?: string): Promise<AIResponseResult> {
+  async generateReply(leadId: string, userGuidance?: string, targetMessageId?: string): Promise<AIResponseResult> {
     const lead = this.db.getLead(leadId);
     if (!lead) throw new Error(`Lead ${leadId} not found.`);
 
     const conv = this.db.getClientConversation(leadId);
-    const messages = this.db.getConversationMessages(leadId);
+    let messages = this.db.getConversationMessages(leadId);
     const customServices = this.db.listCustomServices();
     const run = lead.runId ? this.db.getRun(lead.runId) : null;
 
@@ -185,7 +185,17 @@ export class ConversationEngine {
     const senderType = run?.request.senderType || 'auto';
     const identity = resolveSenderIdentity(userName, company, senderType);
 
-    const lastClientMessage = [...messages].reverse().find((m) => m.sender === 'client');
+    // If targetMessageId is specified, restrict history to messages up to targetMessageId
+    let targetMessage: ConversationMessage | undefined;
+    if (targetMessageId) {
+      const idx = messages.findIndex((m) => m.id === targetMessageId);
+      if (idx !== -1) {
+        targetMessage = messages[idx];
+        messages = messages.slice(0, idx + 1);
+      }
+    }
+
+    const lastClientMessage = targetMessage || [...messages].reverse().find((m) => m.sender === 'client');
     const clientText = lastClientMessage?.text || '';
 
     // Step 1: Immediate opt-out check

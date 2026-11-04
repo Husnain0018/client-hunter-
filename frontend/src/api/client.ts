@@ -270,23 +270,49 @@ export const api = {
     });
   },
   subscribeToClientEvents(onEvent: (event: any) => void): () => void {
-    const token = localStorage.getItem(TOKEN_KEY) || '';
-    const sseUrl = `${API}/api/clients/events?token=${encodeURIComponent(token)}`;
     let eventSource: EventSource | null = null;
-    try {
-      eventSource = new EventSource(sseUrl);
-      eventSource.onmessage = (e) => {
-        try {
-          const data = JSON.parse(e.data);
-          onEvent(data);
-        } catch {
-          // ignore malformed SSE payloads
+    let reconnectTimeout: any = null;
+    let isClosed = false;
+
+    function connect() {
+      if (isClosed) return;
+      try {
+        const curToken = localStorage.getItem(TOKEN_KEY) || '';
+        const url = `${API}/api/clients/events?token=${encodeURIComponent(curToken)}`;
+        eventSource = new EventSource(url);
+
+        eventSource.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            onEvent(data);
+          } catch {
+            // ignore malformed SSE payloads
+          }
+        };
+
+        eventSource.onerror = () => {
+          if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+          }
+          if (!isClosed) {
+            clearTimeout(reconnectTimeout);
+            reconnectTimeout = setTimeout(connect, 3000);
+          }
+        };
+      } catch {
+        if (!isClosed) {
+          clearTimeout(reconnectTimeout);
+          reconnectTimeout = setTimeout(connect, 5000);
         }
-      };
-    } catch {
-      // fallback polling handles updates if EventSource fails
+      }
     }
+
+    connect();
+
     return () => {
+      isClosed = true;
+      clearTimeout(reconnectTimeout);
       if (eventSource) {
         eventSource.close();
         eventSource = null;
@@ -640,7 +666,7 @@ export const api = {
   }) =>
     request<{
       ok: boolean;
-      deliveryStatus: 'sent' | 'delivery_confirmed' | 'failed';
+      deliveryStatus: JobApplicationEmailRecord['deliveryStatus'];
       application: JobApplication;
       emailRecord: JobApplicationEmailRecord;
       attachedResume?: string | null;
@@ -692,6 +718,34 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     }),
+
+  openGmailApplication: (id: string) =>
+    request<{ ok: boolean; application: JobApplication }>(`/api/career/applications/${id}/open-gmail`, {
+      method: 'POST',
+    }),
+
+  confirmSentApplication: (id: string) =>
+    request<{ ok: boolean; application: JobApplication }>(`/api/career/applications/${id}/confirm-sent`, {
+      method: 'POST',
+    }),
+
+  syncGmailApplications: () =>
+    request<{
+      ok: boolean;
+      summary?: {
+        bouncesDetected: number;
+        bouncesApplied: number;
+        sentConfirmed: number;
+        repliesDetected: number;
+        details: string[];
+      };
+      error?: string;
+    }>('/api/career/applications/sync-gmail', {
+      method: 'POST',
+    }),
+
+  getBounces: () =>
+    request<{ ok: boolean; bounces: any[] }>('/api/career/applications/bounces'),
 
   getJobNotifications: () => request<{ ok: boolean; notifications: JobNotification[] }>('/api/career/notifications'),
 
